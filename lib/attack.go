@@ -456,11 +456,16 @@ func (a *Attacker) Attack(tr Targeter, p Pacer, du time.Duration, name string) <
 		began: time.Now(),
 	}
 
+	// Adaptive pacers consume runtime feedback (accepted hits, settled
+	// results, halt and worker-saturation signals) through this optional
+	// interface. A nil hook leaves every other Pacer on its old behaviour.
+	fb, _ := p.(feedbackPacer)
+
 	results := make(chan *Result)
 	ticks := make(chan struct{})
 	for i := uint64(0); i < workers; i++ {
 		wg.Add(1)
-		go a.attack(tr, atk, &wg, ticks, results)
+		go a.attack(tr, atk, &wg, ticks, results, fb)
 	}
 
 	go func() {
@@ -489,21 +494,49 @@ func (a *Attacker) Attack(tr Targeter, p Pacer, du time.Duration, name string) <
 				select {
 				case ticks <- struct{}{}:
 					count++
+					if fb != nil {
+						fb.onAccepted()
+					}
 					continue
 				case <-a.stopch:
+					if fb != nil {
+						fb.onHalt(HaltAttackerStopped)
+					}
 					return
 				default:
 					// all workers are blocked. start one more and try again
 					workers++
 					wg.Add(1)
-					go a.attack(tr, atk, &wg, ticks, results)
+					go a.attack(tr, atk, &wg, ticks, results, fb)
+					if fb != nil {
+						fb.onWorkersSaturated()
+					}
+				}
+			} else if fb != nil {
+				// The worker pool is already at its ceiling. A non-blocking
+				// probe below tells the adaptive pacer that every worker is
+				// saturated; without it the blocking send could hide that
+				// signal indefinitely until the attack stops.
+				select {
+				case ticks <- struct{}{}:
+					count++
+					fb.onAccepted()
+					continue
+				default:
+					fb.onWorkersSaturated()
 				}
 			}
 
 			select {
 			case ticks <- struct{}{}:
 				count++
+				if fb != nil {
+					fb.onAccepted()
+				}
 			case <-a.stopch:
+				if fb != nil {
+					fb.onHalt(HaltAttackerStopped)
+				}
 				return
 			}
 		}
@@ -526,10 +559,18 @@ func (a *Attacker) Stop() bool {
 	}
 }
 
-func (a *Attacker) attack(tr Targeter, atk *attack, workers *sync.WaitGroup, ticks <-chan struct{}, results chan<- *Result) {
+func (a *Attacker) attack(tr Targeter, atk *attack, workers *sync.WaitGroup, ticks <-chan struct{}, results chan<- *Result, fb feedbackPacer) {
 	defer workers.Done()
 	for range ticks {
-		results <- a.hit(tr, atk)
+		r := a.hit(tr, atk)
+		results <- r
+		// Feedback is recorded after delivery so in-flight requests also
+		// account for result-channel backpressure. It is a separate
+		// observation path from Metrics and reporters, which are fed by
+		// the Attack caller.
+		if fb != nil {
+			fb.onResult(r)
+		}
 	}
 }
 
