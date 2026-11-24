@@ -848,6 +848,41 @@ func main() {
 }
 ```
 
+##### Incremental reports
+
+`IncrementalReporter` aggregates results exactly like `Metrics` but publishes
+finalized, cumulative snapshots on a channel at a configurable interval, so a
+monitoring panel can render the pressure curve while an attack is still
+running (or after it was cancelled). Every snapshot contains all results seen
+so far — it is the same summary written at the end, not an interval delta.
+
+A slow subscriber never blocks the attack: the channel buffers a single
+"latest" snapshot and any stale snapshot is discarded and counted in
+`DroppedSnapshots`. `Close` publishes the final complete summary and closes
+the channel.
+
+```go
+rep := vegeta.NewIncrementalReporter(2 * time.Second) // panel polls/cadence
+
+go func() {
+  http.Handle("/metrics.json", rep.SnapshotHandler()) // pull based JSON/text
+  log.Fatal(http.ListenAndServe(":8080", nil))
+}()
+
+for res := range attacker.Attack(targeter, rate, duration, "live") {
+  rep.Add(res)
+}
+rep.Close() // final snapshot is emitted, then rep.Snapshots() is closed
+
+for m := range rep.Snapshots() {
+  b, _ := json.Marshal(m) // cumulative Metrics, compatible with NewTextReporter/NewJSONReporter
+  dashboard.Push(b)
+}
+```
+
+`vegeta report --every=2s` provides the same fixed-interval cumulative
+reporting on the command line from a streamed result source.
+
 #### Limitations
 
 There will be an upper bound of the supported `rate` which varies on the
