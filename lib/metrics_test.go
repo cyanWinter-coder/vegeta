@@ -2,16 +2,14 @@ package vegeta
 
 import (
 	"io"
+	"math"
 	"math/rand"
 	"reflect"
 	"testing"
 	"time"
 
-	bmizerany "github.com/bmizerany/perks/quantile"
-	gk "github.com/dgryski/go-gk"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	streadway "github.com/streadway/quantile"
 )
 
 func TestMetrics_Add(t *testing.T) {
@@ -46,9 +44,9 @@ func TestMetrics_Add(t *testing.T) {
 			Total:     duration("50.005s"),
 			Mean:      duration("5.0005ms"),
 			P50:       duration("5.0005ms"),
-			P90:       duration("9.0005ms"),
-			P95:       duration("9.5005ms"),
-			P99:       duration("9.9005ms"),
+			P90:       duration("9.0001ms"),
+			P95:       duration("9.50005ms"),
+			P99:       duration("9.90001ms"),
 			Max:       duration("10ms"),
 			Min:       duration("1us"),
 			estimator: got.Latencies.estimator,
@@ -62,7 +60,7 @@ func TestMetrics_Add(t *testing.T) {
 		Wait:        duration("10ms"),
 		Requests:    10000,
 		Rate:        1.000100010001,
-		Throughput:  0.6667660098349737,
+		Throughput:  0.6667666766676668,
 		Success:     0.6667,
 		StatusCodes: map[string]int{"500": 3333, "200": 3334, "302": 3333},
 		Errors:      []string{"Internal server error"},
@@ -112,15 +110,165 @@ func (a durationApproximator) compare(x, y time.Duration) bool {
 	return (x + a.margin) >= y
 }
 
-// https://github.com/tsenart/vegeta/issues/208
+// https://github.com//tsenart/vegeta/issues/208
 func TestMetrics_NoInfiniteRate(t *testing.T) {
 	t.Parallel()
 
+	// A single request defines a zero-length measurement window, so there is
+	// no interval over which a rate can be computed. It must stay zero rather
+	// than becoming +Inf or NaN through a division by zero.
 	m := Metrics{Requests: 1, Duration: time.Microsecond}
 	m.Close()
 
-	if got, want := m.Rate, 1.0; got != want {
+	if got, want := m.Rate, 0.0; got != want {
 		t.Errorf("got rate %f, want %f", got, want)
+	}
+	if got, want := m.Throughput, 0.0; got != want {
+		t.Errorf("got throughput %f, want %f", got, want)
+	}
+	if math.IsInf(m.Rate, 0) || math.IsNaN(m.Rate) {
+		t.Errorf("rate must be finite, got %v", m.Rate)
+	}
+}
+
+// TestMetrics_RateAndThroughputWindow verifies that rate and throughput are
+// computed over the request window (Latest - Earliest) and that the wait for
+// in-flight responses after the last request is not counted.
+func TestMetrics_RateAndThroughputWindow(t *testing.T) {
+	t.Parallel()
+
+	var m Metrics
+	// Two requests sent one second apart; the last one takes 500ms to answer.
+	m.Add(&Result{Code: 200, Timestamp: time.Unix(0, 0), Latency: time.Millisecond})
+	m.Add(&Result{Code: 200, Timestamp: time.Unix(1, 0), Latency: 500 * time.Millisecond})
+	m.Close()
+
+	if got, want := m.Duration, time.Second; got != want {
+		t.Errorf("got duration %s, want %s", got, want)
+	}
+	if got, want := m.Wait, 500*time.Millisecond; got != want {
+		t.Errorf("got wait %s, want %s", got, want)
+	}
+	// Both requests and both successes over a 1s window, excluding the wait.
+	if got, want := m.Rate, 2.0; got != want {
+		t.Errorf("got rate %f, want %f", got, want)
+	}
+	if got, want := m.Throughput, 2.0; got != want {
+		t.Errorf("got throughput %f, want %f", got, want)
+	}
+}
+
+// TestMetrics_SuccessBoundaries pins down the exact success ratio at the
+// boundaries: all successful, all failed and partial mixes must match the
+// integer count ratio without approximation errors.
+func TestMetrics_SuccessBoundaries(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		codes   []uint16
+		success float64
+	}{
+		{"all successful", []uint16{200, 201, 204, 301}, 1.0},
+		{"all failed", []uint16{0, 500, 404, 503}, 0.0},
+		{"one of three", []uint16{200, 500, 502}, 1.0 / 3.0},
+		{"two of three", []uint16{200, 302, 500}, 2.0 / 3.0},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var m Metrics
+			for i, code := range tc.codes {
+				m.Add(&Result{
+					Code:      code,
+					Timestamp: time.Unix(int64(i), 0),
+					Latency:   time.Millisecond,
+				})
+			}
+			m.Close()
+
+			if m.Success != tc.success {
+				t.Errorf("got success %v, want %v", m.Success, tc.success)
+			}
+			// The exact ratio must survive percentage rendering: a fully
+			// successful run reports 100.00%, never 99.9x%.
+			if pct := m.Success * 100; pct < 0 || pct > 100 {
+				t.Errorf("success percentage out of range: %v", pct)
+			}
+		})
+	}
+}
+
+// TestMetrics_QuantilesWithinSampleRange verifies the original customer-facing
+// defect: percentiles computed from the sorted samples can never escape the
+// observed [Min, Max] range, even with a skewed latency distribution.
+func TestMetrics_QuantilesWithinSampleRange(t *testing.T) {
+	t.Parallel()
+
+	var m Metrics
+	// Mostly small latencies with a few multi-second outliers, unsorted.
+	latencies := []time.Duration{
+		2 * time.Second, 3 * time.Millisecond, 1 * time.Millisecond,
+		7 * time.Millisecond, 5 * time.Millisecond, 2 * time.Millisecond,
+		9 * time.Millisecond, 4 * time.Millisecond, 6 * time.Millisecond,
+		8 * time.Millisecond, 5 * time.Second,
+	}
+	for i, latency := range latencies {
+		m.Add(&Result{
+			Code:      200,
+			Timestamp: time.Unix(int64(i), 0),
+			Latency:   latency,
+		})
+	}
+	m.Close()
+
+	min, max := time.Millisecond, 5*time.Second
+	for _, tc := range []struct {
+		name string
+		got  time.Duration
+	}{
+		{"P50", m.Latencies.P50},
+		{"P90", m.Latencies.P90},
+		{"P95", m.Latencies.P95},
+		{"P99", m.Latencies.P99},
+	} {
+		if tc.got < min || tc.got > max {
+			t.Errorf("%s=%s outside sample range [%s, %s]", tc.name, tc.got, min, max)
+		}
+	}
+
+	// The extremes of the quantile range collapse onto the observed extremes.
+	if got := m.Latencies.Quantile(0); got != min {
+		t.Errorf("quantile(0) = %s, want min %s", got, min)
+	}
+	if got := m.Latencies.Quantile(1); got != max {
+		t.Errorf("quantile(1) = %s, want max %s", got, max)
+	}
+	// Out-of-range quantile arguments are clamped instead of extrapolating.
+	if got := m.Latencies.Quantile(2); got != max {
+		t.Errorf("quantile(2) = %s, want max %s", got, max)
+	}
+	if got := m.Latencies.Quantile(-1); got != min {
+		t.Errorf("quantile(-1) = %s, want min %s", got, min)
+	}
+}
+
+// TestMetrics_ZeroLatencySample ensures a zero latency is treated as a real
+// minimum rather than an unset sentinel.
+func TestMetrics_ZeroLatencySample(t *testing.T) {
+	t.Parallel()
+
+	var m Metrics
+	m.Add(&Result{Code: 200, Timestamp: time.Unix(0, 0), Latency: 0})
+	m.Add(&Result{Code: 200, Timestamp: time.Unix(1, 0), Latency: time.Millisecond})
+	m.Close()
+
+	if m.Latencies.Min != 0 {
+		t.Errorf("got min %s, want 0", m.Latencies.Min)
+	}
+	if m.Latencies.Quantile(0) != 0 {
+		t.Errorf("quantile(0) = %s, want 0", m.Latencies.Quantile(0))
 	}
 }
 
@@ -145,6 +293,22 @@ func TestMetrics_EmptyMetricsCanBeReported(t *testing.T) {
 	var m Metrics
 	m.Close()
 
+	// An empty result set yields zero values, never NaN or Inf, so reports
+	// remain numerically valid without any samples.
+	if m.Requests != 0 || m.Rate != 0 || m.Throughput != 0 || m.Success != 0 {
+		t.Errorf("empty Metrics has non-zero counters: %+v", m)
+	}
+	for _, f := range []float64{m.Rate, m.Throughput, m.Success, m.BytesIn.Mean, m.BytesOut.Mean} {
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			t.Errorf("empty Metrics contains NaN/Inf value: %v", f)
+		}
+	}
+	for _, q := range []float64{0, 0.5, 0.99, 1} {
+		if got := m.Latencies.Quantile(q); got != 0 {
+			t.Errorf("empty quantile(%v) = %s, want 0", q, got)
+		}
+	}
+
 	reporter := NewJSONReporter(&m)
 	if err := reporter(io.Discard); err != nil {
 		t.Error(err)
@@ -161,70 +325,24 @@ func BenchmarkMetrics(b *testing.B) {
 		latencies[i] = time.Duration(1e6 + rng.Int63n(1e10-1e6)) // 1ms to 10s
 	}
 
-	for _, tc := range []struct {
-		name string
-		estimator
-	}{
-		{"streadway/quantile", streadway.New(
-			streadway.Known(0.50, 0.01),
-			streadway.Known(0.90, 0.005),
-			streadway.Known(0.95, 0.001),
-			streadway.Known(0.99, 0.0005),
-		)},
-		{"bmizerany/perks/quantile", newBmizeranyEstimator(
-			0.50,
-			0.90,
-			0.95,
-			0.99,
-		)},
-		{"dgrisky/go-gk", newDgriskyEstimator(0.5)},
-		{"influxdata/tdigest", newTdigestEstimator(100)},
-	} {
-		m := Metrics{Latencies: LatencyMetrics{estimator: tc.estimator}}
-		b.Run("Add/"+tc.name, func(b *testing.B) {
-			for i := 0; i <= b.N; i++ {
-				m.Add(&Result{
-					Code:      200,
-					Timestamp: time.Unix(int64(i), 0),
-					Latency:   latencies[i%len(latencies)],
-					BytesIn:   1024,
-					BytesOut:  512,
-				})
-			}
+	m := Metrics{Latencies: LatencyMetrics{estimator: newSortedSamplesEstimator()}}
 
-		})
+	b.Run("Add", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			m.Add(&Result{
+				Code:      200,
+				Timestamp: time.Unix(int64(i), 0),
+				Latency:   latencies[i%len(latencies)],
+				BytesIn:   1024,
+				BytesOut:  512,
+			})
+		}
+	})
 
-		b.Run("Close/"+tc.name, func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				m.Close()
-			}
-		})
-	}
+	b.Run("Close", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			m.Close()
+		}
+	})
 
-}
-
-type bmizeranyEstimator struct {
-	*bmizerany.Stream
-}
-
-func newBmizeranyEstimator(qs ...float64) *bmizeranyEstimator {
-	return &bmizeranyEstimator{Stream: bmizerany.NewTargeted(qs...)}
-}
-
-func (e *bmizeranyEstimator) Add(s float64) { e.Insert(s) }
-func (e *bmizeranyEstimator) Get(q float64) float64 {
-	return e.Query(q)
-}
-
-type dgryskiEstimator struct {
-	*gk.Stream
-}
-
-func newDgriskyEstimator(epsilon float64) *dgryskiEstimator {
-	return &dgryskiEstimator{Stream: gk.New(epsilon)}
-}
-
-func (e *dgryskiEstimator) Add(s float64) { e.Insert(s) }
-func (e *dgryskiEstimator) Get(q float64) float64 {
-	return e.Query(q)
 }

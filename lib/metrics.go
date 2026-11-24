@@ -1,10 +1,10 @@
 package vegeta
 
 import (
+	"math"
+	"sort"
 	"strconv"
 	"time"
-
-	"github.com/influxdata/tdigest"
 )
 
 // Metrics holds metrics computed out of a slice of Results which are used
@@ -87,31 +87,44 @@ func (m *Metrics) Add(r *Result) {
 
 // Close implements the Close method of the Report interface by computing
 // derived summary metrics which don't need to be run on every Add call.
+// All derived metrics are computed from the complete sample set, so an
+// empty Metrics stays at its zero values instead of producing NaNs.
 func (m *Metrics) Close() {
 	m.init()
 
+	// With no samples there is nothing to aggregate; leave every derived
+	// metric at its zero value rather than dividing by zero.
 	if m.Requests == 0 {
 		return
 	}
 
-	m.Rate = float64(m.Requests)
-	m.Throughput = float64(m.success)
+	// The measurement window spans from the first request sent to the last
+	// request sent. Responses still in flight after the last request was sent
+	// (m.Wait) fall outside this window and must not inflate rate calculations.
 	m.Duration = m.Latest.Sub(m.Earliest)
 	m.Wait = m.End.Sub(m.Latest)
-	if secs := m.Duration.Seconds(); secs > 0 {
-		m.Rate /= secs
-		// No need to check for zero because we know m.Duration > 0
-		m.Throughput /= (m.Duration + m.Wait).Seconds()
-	}
 
 	m.BytesIn.Mean = float64(m.BytesIn.Total) / float64(m.Requests)
 	m.BytesOut.Mean = float64(m.BytesOut.Total) / float64(m.Requests)
+
+	// Success is the exact ratio of successful requests over the total. It is
+	// bounded to [0, 1] by construction, so 100% successful runs report 1.0
+	// exactly rather than an approximation.
 	m.Success = float64(m.success) / float64(m.Requests)
 	m.Latencies.Mean = time.Duration(float64(m.Latencies.Total) / float64(m.Requests))
 	m.Latencies.P50 = m.Latencies.Quantile(0.50)
 	m.Latencies.P90 = m.Latencies.Quantile(0.90)
 	m.Latencies.P95 = m.Latencies.Quantile(0.95)
 	m.Latencies.P99 = m.Latencies.Quantile(0.99)
+
+	// Rate and throughput are both measured over the same request window. A
+	// single request, or requests sharing a timestamp, has a zero-length
+	// window: there is no measurable interval, so the rates stay zero instead
+	// of dividing by zero or producing an infinite value.
+	if secs := m.Duration.Seconds(); secs > 0 {
+		m.Rate = float64(m.Requests) / secs
+		m.Throughput = float64(m.success) / secs
+	}
 }
 
 func (m *Metrics) init() {
@@ -153,16 +166,19 @@ type LatencyMetrics struct {
 // Add adds the given latency to the latency metrics.
 func (l *LatencyMetrics) Add(latency time.Duration) {
 	l.init()
-	if l.Total += latency; latency > l.Max {
-		l.Max = latency
-	}
-	if latency < l.Min || l.Min == 0 {
+	l.Total += latency
+	if l.estimator.Len() == 0 || latency < l.Min {
 		l.Min = latency
+	}
+	if latency > l.Max {
+		l.Max = latency
 	}
 	l.estimator.Add(float64(latency))
 }
 
-// Quantile returns the nth quantile from the latency summary.
+// Quantile returns the nth quantile from the latency summary. The returned
+// value is computed from the sorted samples and always falls within the
+// observed [Min, Max] range, so it can never exceed Max or drop below Min.
 func (l LatencyMetrics) Quantile(nth float64) time.Duration {
 	l.init()
 	return time.Duration(l.estimator.Get(nth))
@@ -170,9 +186,7 @@ func (l LatencyMetrics) Quantile(nth float64) time.Duration {
 
 func (l *LatencyMetrics) init() {
 	if l.estimator == nil {
-		// This compression parameter value is the recommended value
-		// for normal uses as per http://javadox.com/com.tdunning/t-digest/3.0/com/tdunning/math/stats/TDigest.html
-		l.estimator = newTdigestEstimator(100)
+		l.estimator = newSortedSamplesEstimator()
 	}
 }
 
@@ -187,15 +201,63 @@ type ByteMetrics struct {
 type estimator interface {
 	Add(sample float64)
 	Get(quantile float64) float64
+	Len() int
 }
 
-type tdigestEstimator struct{ *tdigest.TDigest }
-
-func newTdigestEstimator(compression float64) *tdigestEstimator {
-	return &tdigestEstimator{TDigest: tdigest.NewWithCompression(compression)}
+// sortedSamplesEstimator keeps every observed sample and computes exact
+// quantiles from the sorted sample set. Unlike streaming digest estimators,
+// its results are actual observed values (or interpolations between adjacent
+// ones) and are therefore always bounded by the minimum and maximum samples.
+type sortedSamplesEstimator struct {
+	samples []float64
+	sorted  bool
 }
 
-func (e *tdigestEstimator) Add(s float64) { e.TDigest.Add(s, 1) }
-func (e *tdigestEstimator) Get(q float64) float64 {
-	return e.TDigest.Quantile(q)
+func newSortedSamplesEstimator() *sortedSamplesEstimator {
+	return &sortedSamplesEstimator{sorted: true}
+}
+
+func (e *sortedSamplesEstimator) Add(s float64) {
+	// Samples are usually appended in arbitrary order, so the slice becomes
+	// unsorted as soon as a new sample is smaller than the previous one.
+	// After a sort, samples[len-1] is the maximum, so the same check remains
+	// valid even if Adds are interleaved with Get calls.
+	if e.sorted && len(e.samples) > 0 && s < e.samples[len(e.samples)-1] {
+		e.sorted = false
+	}
+	e.samples = append(e.samples, s)
+}
+
+func (e *sortedSamplesEstimator) Len() int { return len(e.samples) }
+
+// Get returns the quantile at q in [0, 1] using linear interpolation between
+// the two closest ranks (the R-7 method, same definition used by NumPy and
+// Go's external quantile libraries). The result is clamped to the observed
+// sample range, so q=0 yields the minimum and q=1 the maximum.
+func (e *sortedSamplesEstimator) Get(q float64) float64 {
+	n := len(e.samples)
+	if n == 0 {
+		return 0
+	}
+
+	if !e.sorted {
+		sort.Float64s(e.samples)
+		e.sorted = true
+	}
+
+	q = math.Max(0, math.Min(1, q))
+	if n == 1 {
+		return e.samples[0]
+	}
+
+	// Continuous rank of the quantile over indices [0, n-1].
+	pos := q * float64(n-1)
+	lo := float64(int(pos))
+	hi := math.Ceil(pos)
+	if lo == hi {
+		return e.samples[int(lo)]
+	}
+
+	frac := pos - lo
+	return e.samples[int(lo)]*(1-frac) + e.samples[int(hi)]*frac
 }
