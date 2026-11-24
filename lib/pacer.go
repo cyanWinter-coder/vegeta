@@ -56,19 +56,31 @@ func (cp ConstantPacer) Pace(elapsed time.Duration, hits uint64) (time.Duration,
 		return 0, true
 	}
 
-	expectedHits := uint64(cp.Freq) * uint64(elapsed/cp.Per)
-	if hits < expectedHits {
-		// Running behind, send next hit immediately.
-		return 0, false
-	}
 	interval := uint64(cp.Per.Nanoseconds() / int64(cp.Freq))
 	if math.MaxInt64/interval < hits {
 		// We would overflow delta if we continued, so stop the attack.
 		return 0, true
 	}
+
+	expectedHits := uint64(cp.Freq) * uint64(elapsed/cp.Per)
+	if hits < expectedHits {
+		// Running behind, e.g. after a scheduling stall, a clock jump or a
+		// suspend/resume. Do not repay the backlog with back-to-back hits,
+		// which would create a burst at unlimited rate. Re-base the schedule
+		// on the current instant and keep pacing at the constant interval,
+		// so the rate stays stable within one scheduling interval.
+		return time.Duration(interval), false
+	}
 	delta := time.Duration((hits + 1) * interval)
-	// Zero or negative durations cause time.Sleep to return immediately.
-	return delta - elapsed, false
+	wait := delta - elapsed
+	if wait <= 0 {
+		// A zero or negative wait would make time.Sleep return immediately
+		// and fire a back-to-back hit. Re-base at the constant interval so
+		// an overrun cannot collapse into a catch-up burst. Positive
+		// sub-interval waits are preserved to retain the exact mean rate.
+		wait = time.Duration(interval)
+	}
+	return wait, false
 }
 
 // Rate returns a ConstantPacer's instantaneous hit rate (i.e. requests per second)
@@ -180,8 +192,15 @@ func (sp SinePacer) Pace(elapsedTime time.Duration, elapsedHits uint64) (time.Du
 	}
 	expectedHits := sp.hits(elapsedTime)
 	if elapsedHits < uint64(expectedHits) {
-		// Running behind, send next hit immediately.
-		return 0, false
+		// Running behind, e.g. after a scheduling stall, a clock jump or a
+		// suspend/resume. Re-base the schedule on the current instant and
+		// wait one interval at the current instantaneous rate instead of
+		// repaying the backlog with back-to-back hits.
+		nsPerHit := math.Round(1 / sp.hitsPerNs(elapsedTime))
+		if nsPerHit <= 0 {
+			return 0, false
+		}
+		return time.Duration(nsPerHit), false
 	}
 	// Re-arranging our hits equation to provide a duration given the number of
 	// requests sent is non-trivial, so we must solve for the duration numerically.
@@ -265,13 +284,28 @@ func (p LinearPacer) Pace(elapsed time.Duration, hits uint64) (time.Duration, bo
 	}
 
 	expectedHits := p.hits(elapsed)
-	if hits == 0 || hits < uint64(expectedHits) {
-		// Running behind, send next hit immediately.
+	switch {
+	case hits == 0 && elapsed == 0:
+		// The very first hit is dispatched immediately so the attack
+		// starts without waiting for the first ramp interval.
 		return 0, false
+	case hits < uint64(expectedHits):
+		// Running behind, e.g. after a scheduling stall, a clock jump or a
+		// suspend/resume. Re-base the schedule on the current instant and
+		// wait one interval at the current instantaneous rate instead of
+		// repaying the backlog with back-to-back hits. The rate keeps
+		// following the linear ramp computed from elapsed time.
+		interval := p.interval(elapsed)
+		if interval <= 0 {
+			return 0, false
+		}
+		return interval, false
 	}
 
-	rate := p.Rate(elapsed)
-	interval := math.Round(1e9 / rate)
+	interval := p.interval(elapsed)
+	if interval <= 0 {
+		return 0, false
+	}
 
 	if n := uint64(interval); n != 0 && math.MaxInt64/n < hits {
 		// We would overflow wait if we continued, so stop the attack.
@@ -279,9 +313,27 @@ func (p LinearPacer) Pace(elapsed time.Duration, hits uint64) (time.Duration, bo
 	}
 
 	delta := float64(hits+1) - expectedHits
-	wait := time.Duration(interval * delta)
+	wait := time.Duration(float64(interval) * delta)
+	if wait <= 0 {
+		// A zero or negative wait would make time.Sleep return immediately
+		// and fire a back-to-back hit. Re-base at one interval of the
+		// current instantaneous rate so an overrun cannot burst.
+		wait = interval
+	}
 
 	return wait, false
+}
+
+// interval returns the number of nanoseconds between two consecutive hits at
+// the given elapsed attack time, based on the instantaneous ramp rate. It can
+// be zero when the rate is (near) infinite, in which case hits are sent
+// immediately.
+func (p LinearPacer) interval(elapsed time.Duration) time.Duration {
+	rate := p.Rate(elapsed)
+	if rate <= 0 {
+		return 0
+	}
+	return time.Duration(math.Round(1e9 / rate))
 }
 
 // Rate returns a LinearPacer's instantaneous hit rate (i.e. requests per second)

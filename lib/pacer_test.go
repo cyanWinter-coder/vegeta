@@ -20,20 +20,21 @@ func TestConstantPacer(t *testing.T) {
 		stop    bool
 	}{
 		// :-( HAPPY PATH TESTS :-)
-		// 1 hit/sec, 0 hits sent, 1s elapsed => 0s until next hit
-		// (time.Sleep will return immediately in this case)
-		{1, time.Second, time.Second, 0, 0, false},
-		// 1 hit/sec, 0 hits sent, 2s elapsed => 0s (-1s) until next hit
-		// (time.Sleep will return immediately in this case)
-		{1, time.Second, 2 * time.Second, 0, 0, false},
+		// 1 hit/sec, 0 hits sent, 1s elapsed => 1s until next hit
+		// (behind schedule: re-base at the constant interval, no burst)
+		{1, time.Second, time.Second, 0, time.Second, false},
+		// 1 hit/sec, 0 hits sent, 2s elapsed => 1s until next hit
+		// (behind schedule: re-base at the constant interval, no burst)
+		{1, time.Second, 2 * time.Second, 0, time.Second, false},
 		// 1 hit/sec, 1 hit sent, 1s elapsed => 1s until next hit
 		{1, time.Second, time.Second, 1, time.Second, false},
 		// 1 hit/sec, 2 hits sent, 1s elapsed => 2s until next hit
 		{1, time.Second, time.Second, 2, 2 * time.Second, false},
 		// 1 hit/sec, 10 hits sent, 1s elapsed => 10s until next hit
 		{1, time.Second, time.Second, 10, 10 * time.Second, false},
-		// 1 hit/sec, 10 hits sent, 11s elapsed => 0s until next hit
-		{1, time.Second, 11 * time.Second, 10, 0, false},
+		// 1 hit/sec, 10 hits sent, 11s elapsed => 1s until next hit
+		// (behind schedule: re-base at the constant interval, no burst)
+		{1, time.Second, 11 * time.Second, 10, time.Second, false},
 		// 2 hit/sec, 9 hits sent, 4.9s elapsed => 100ms until next hit
 		{2, time.Second, (49 * time.Second) / 10, 9, 100 * time.Millisecond, false},
 
@@ -245,7 +246,9 @@ func TestSinePacerPace_Flat(t *testing.T) {
 		{64 * time.Second / 100, 0, 36 * time.Second / 100, false},
 		{99 * time.Second / 100, 0, time.Second / 100, false},
 		{time.Second, 1, time.Second, false},
-		{time.Second, 0, 0, false},
+		// Behind schedule: re-base at the constant 1 hit/s interval
+		// instead of sending a catch-up hit immediately.
+		{time.Second, 0, time.Second, false},
 	}
 
 	for i, test := range tests {
@@ -301,32 +304,38 @@ func TestLinearPacer(t *testing.T) {
 		stop    bool
 	}{
 		// :-( HAPPY PATH TESTS WITH slope=0 :-)
-		// 1 hit/sec, 0 hits sent, 1s elapsed => 0s until next hit
-		// (time.Sleep will return immediately in this case)
-		{1, time.Second, 0, time.Second, 0, 0, false},
-		// 1 hit/sec, 0 hits sent, 2s elapsed => 0s (-1s) until next hit
-		// (time.Sleep will return immediately in this case)
-		{1, time.Second, 0, 2 * time.Second, 0, 0, false},
+		// 1 hit/sec, 0 hits sent, 1s elapsed => 1s until next hit
+		// (behind schedule: re-base at the constant interval, no burst)
+		{1, time.Second, 0, time.Second, 0, time.Second, false},
+		// 1 hit/sec, 0 hits sent, 2s elapsed => 1s until next hit
+		// (behind schedule: re-base at the constant interval, no burst)
+		{1, time.Second, 0, 2 * time.Second, 0, time.Second, false},
 		// 1 hit/sec, 1 hit sent, 1s elapsed => 1s until next hit
 		{1, time.Second, 0, time.Second, 1, time.Second, false},
 		// 1 hit/sec, 2 hits sent, 1s elapsed => 2s until next hit
 		{1, time.Second, 0, time.Second, 2, 2 * time.Second, false},
 		// 1 hit/sec, 10 hits sent, 1s elapsed => 10s until next hit
 		{1, time.Second, 0, time.Second, 10, 10 * time.Second, false},
-		// 1 hit/sec, 10 hits sent, 11s elapsed => 0s until next hit
-		{1, time.Second, 0, 11 * time.Second, 10, 0, false},
+		// 1 hit/sec, 10 hits sent, 11s elapsed => 1s until next hit
+		// (behind schedule: re-base at the constant interval, no burst)
+		{1, time.Second, 0, 11 * time.Second, 10, time.Second, false},
 		// 2 hit/sec, 9 hits sent, 4.9s elapsed => 100ms until next hit
 		{2, time.Second, 0, (49 * time.Second) / 10, 9, 100 * time.Millisecond, false},
 
 		// :-( HAPPY PATH TESTS WITH slope > 0 :-)
-		{1, time.Second, 1, 0, 0, 0, false},
-		{1, time.Second, 1, time.Second, 0, 0, false}, // Running behind, no wait
+		// Start at 1 hit/s, ramping up by 1 hit/s every second.
+		{1, time.Second, 1, 0, 0, 0, false}, // first hit is dispatched immediately at t=0
+		// 1s elapsed with no hits sent: re-base at the current rate
+		// (2 hits/s) and wait one interval, instead of bursting to catch up.
+		{1, time.Second, 1, 1 * time.Second, 0, 500 * time.Millisecond, false},
 		{1, time.Second, 1, 1 * time.Second, 1, 250 * time.Millisecond, false},
-		{1, time.Second, 1, 2 * time.Second, 3, 0, false},
-		{1, time.Second, 1, 3 * time.Second, 6, 0, false},
-		{1, time.Second, 1, 4 * time.Second, 11, 0, false},
-		{1, time.Second, 1, 5 * time.Second, 16, 0, false},
-		{1, time.Second, 1, 6 * time.Second, 23, 0, false},
+		// Behind schedule: re-base at the current instantaneous rate,
+		// no back-to-back catch-up hits.
+		{1, time.Second, 1, 2 * time.Second, 3, 333333333, false}, // rate 3 hits/s
+		{1, time.Second, 1, 3 * time.Second, 6, 250 * time.Millisecond, false},
+		{1, time.Second, 1, 4 * time.Second, 11, 200 * time.Millisecond, false},
+		{1, time.Second, 1, 5 * time.Second, 16, 166666667, false}, // rate 6 hits/s
+		{1, time.Second, 1, 6 * time.Second, 23, 142857143, false}, // rate 7 hits/s
 
 		// :-( SAD PATH TESTS :-(
 		// Zero frequency.
@@ -424,5 +433,132 @@ func TestLinearPacer_Rate(t *testing.T) {
 
 	if err := quick.Check(prop, &quick.Config{MaxCount: 1e6}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestConstantPacer_NoCatchUpBurst verifies that once the attack is behind
+// schedule, the pacer re-bases at the constant interval instead of emitting
+// back-to-back zero-wait hits to repay the backlog.
+func TestConstantPacer_NoCatchUpBurst(t *testing.T) {
+	t.Parallel()
+	cp := ConstantPacer{Freq: 100, Per: time.Second} // 10ms per hit
+
+	// However far behind, the wait must never drop below one interval.
+	for _, elapsed := range []time.Duration{
+		time.Second,
+		10 * time.Second,
+		time.Hour,
+	} {
+		if wait, stop := cp.Pace(elapsed, 0); stop || wait != 10*time.Millisecond {
+			t.Errorf("Pace(%s, 0) = (%s, %t); want (%s, false)",
+				elapsed, wait, stop, 10*time.Millisecond)
+		}
+	}
+}
+
+// TestLinearPacer_NoCatchUpBurst verifies that a behind-schedule ramp never
+// repays its backlog with immediate hits: the wait is re-based onto one
+// interval at the current instantaneous rate.
+func TestLinearPacer_NoCatchUpBurst(t *testing.T) {
+	t.Parallel()
+	// 0 -> 500 hits/s over 30s: slope 500/30 hits per second, per second.
+	p := LinearPacer{
+		StartAt: Rate{Freq: 1, Per: time.Second},
+		Slope:   500.0 / 30.0,
+	}
+
+	for _, tc := range []struct {
+		elapsed time.Duration
+		hits    uint64
+	}{
+		{time.Second, 0},       // cold start with nothing sent yet
+		{10 * time.Second, 10}, // far behind mid-ramp
+		{30 * time.Second, 50}, // at the plateau boundary
+		{time.Minute, 100},     // would be deep into the plateau
+	} {
+		wait, stop := p.Pace(tc.elapsed, tc.hits)
+		if stop {
+			t.Fatalf("Pace(%s, %d) signalled stop", tc.elapsed, tc.hits)
+		}
+		want := time.Duration(math.Round(1e9 / p.Rate(tc.elapsed)))
+		if wait != want {
+			t.Errorf("Pace(%s, %d) = %s; want re-based interval %s",
+				tc.elapsed, tc.hits, wait, want)
+		}
+		if wait <= 0 {
+			t.Errorf("Pace(%s, %d) returned non-positive wait %s", tc.elapsed, tc.hits, wait)
+		}
+	}
+}
+
+// TestLinearPacer_StrictRamp verifies the on-schedule hit schedule implied by
+// the pacer follows the integrated rate curve strictly: the cumulative hits
+// at elapsed t equal the integral of Rate(t), i.e. hits(t), so the ramp
+// segment is linear in elapsed time rather than driven by wall-clock drift.
+func TestLinearPacer_StrictRamp(t *testing.T) {
+	t.Parallel()
+	p := LinearPacer{
+		StartAt: Rate{Freq: 10, Per: time.Second},
+		Slope:   20,
+	}
+
+	// Drive the pacer on its own ideal schedule: feed back the waits and
+	// advance elapsed time by them. The scheduled time of each hit tracks
+	// the inverse of the integrated hit curve strictly, so the ramp is
+	// linear in elapsed time rather than driven by wall-clock drift.
+	var (
+		elapsed  time.Duration
+		hits     uint64
+		maxDrift float64
+	)
+	for i := 0; i < 500; i++ {
+		wait, stop := p.Pace(elapsed, hits)
+		if stop {
+			t.Fatalf("pacer stopped at hit %d", hits)
+		}
+		elapsed += wait
+		hits++
+
+		got := p.hits(elapsed)
+		if diff := math.Abs(got - float64(hits)); diff > maxDrift {
+			maxDrift = diff
+		}
+	}
+	// On-schedule pacing follows the integrated curve; integer nanosecond
+	// rounding can lag by at most a single hit, so a 1-hit bound keeps the
+	// guard strict without rejecting rounding noise.
+	if maxDrift > 1 {
+		t.Fatalf("ramp drift grew to %g hits; schedule no longer tracks the linear rate curve", maxDrift)
+	}
+}
+
+// TestSinePacer_NoCatchUpBurst verifies the sine pacer also re-bases instead
+// of bursting when behind schedule.
+func TestSinePacer_NoCatchUpBurst(t *testing.T) {
+	t.Parallel()
+	sp := SinePacer{
+		Period:  time.Minute,
+		Mean:    Rate{Freq: 100, Per: time.Second},
+		Amp:     Rate{Freq: 50, Per: time.Second},
+		StartAt: MeanUp,
+	}
+
+	for _, tc := range []struct {
+		elapsed time.Duration
+		hits    uint64
+	}{
+		{time.Second, 0},
+		{10 * time.Second, 100},
+		{time.Minute, 1000},
+	} {
+		wait, stop := sp.Pace(tc.elapsed, tc.hits)
+		if stop {
+			t.Fatalf("Pace(%s, %d) signalled stop", tc.elapsed, tc.hits)
+		}
+		want := time.Duration(math.Round(1 / sp.hitsPerNs(tc.elapsed)))
+		if !durationEqual(wait, want) {
+			t.Errorf("Pace(%s, %d) = %s; want re-based interval %s",
+				tc.elapsed, tc.hits, wait, want)
+		}
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -561,4 +562,190 @@ func TestAttackConnectTo(t *testing.T) {
 	if diff := cmp.Diff(want, srvs); diff != "" {
 		t.Errorf("unexpected hits (-want +got):\n%s", diff)
 	}
+}
+
+// TestAttackStopInterruptsWait verifies that cancelling an attack breaks the
+// pacing wait immediately instead of blocking until the next interval elapses.
+func TestAttackStopInterruptsWait(t *testing.T) {
+	t.Parallel()
+
+	tr := Targeter(func(*Target) error { return nil })
+	// One hit every 10s: a single pacing interval far exceeds the test budget.
+	p := ConstantPacer{Freq: 1, Per: 10 * time.Second}
+	atk := NewAttacker(Workers(1), MaxWorkers(1))
+
+	res := atk.Attack(tr, p, time.Minute, "")
+
+	// Give the scheduler time to enter the pacing wait.
+	time.Sleep(50 * time.Millisecond)
+	stopped := make(chan struct{})
+	go func() {
+		atk.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Stop() did not return while the pacer was waiting")
+	}
+
+	// The results channel must close promptly: no outstanding wait remains.
+	drained := make(chan struct{})
+	go func() {
+		for range res {
+		}
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("attack did not finish after Stop()")
+	}
+}
+
+// gateTargeter blocks the first gate hits until gateOpen is closed, then
+// serves every subsequent hit immediately. While the gate is shut the
+// scheduler's workers are all stuck, so any backlog the pacer has decided to
+// repay gets flushed the instant the gate opens.
+type gateTargeter struct {
+	mu       sync.Mutex
+	gate     uint64
+	gateOpen chan struct{}
+}
+
+func newGateTargeter(gate uint64) *gateTargeter {
+	return &gateTargeter{gate: gate, gateOpen: make(chan struct{})}
+}
+
+func (g *gateTargeter) Target(tgt *Target) error {
+	g.mu.Lock()
+	block := g.gate > 0
+	if block {
+		g.gate--
+	}
+	g.mu.Unlock()
+	if block {
+		<-g.gateOpen
+	}
+	return nil
+}
+
+// recordingPacer wraps a Pacer and records the waits it hands to the
+// scheduler after a configurable starvation point.
+type recordingPacer struct {
+	Pacer
+	mu        sync.Mutex
+	waits     []time.Duration
+	starveFor time.Duration
+	started   time.Time
+}
+
+func (rp *recordingPacer) Pace(elapsed time.Duration, hits uint64) (time.Duration, bool) {
+	wait, stop := rp.Pacer.Pace(elapsed, hits)
+	if elapsed >= rp.starveFor {
+		rp.mu.Lock()
+		rp.waits = append(rp.waits, wait)
+		rp.mu.Unlock()
+	}
+	return wait, stop
+}
+
+func (rp *recordingPacer) snapshot() []time.Duration {
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	return append([]time.Duration(nil), rp.waits...)
+}
+
+// TestAttackNoCatchUpBurst verifies that after the scheduler has been starved
+// (its worker pool saturated and blocked for several pacing intervals), the
+// pacer never hands it a zero wait to repay the backlog back-to-back. It
+// re-bases onto the constant interval instead.
+func TestAttackNoCatchUpBurst(t *testing.T) {
+	t.Parallel()
+
+	const workers = 4
+	// Gate every worker but leave the pool able to cycle one hit at a time:
+	// blocking all four would also stop the scheduler from consulting the
+	// pacer. Blocking three keeps the pacer running while ticks back up.
+	gt := newGateTargeter(workers - 1)
+	tr := Targeter(gt.Target)
+	// 50 hits/s => one hit every 20ms.
+	inner := ConstantPacer{Freq: 50, Per: time.Second}
+	rp := &recordingPacer{Pacer: inner, starveFor: 150 * time.Millisecond}
+	// Cap the worker pool so blocked workers cannot be replaced by new ones.
+	atk := NewAttacker(Workers(workers), MaxWorkers(workers))
+
+	res := atk.Attack(tr, rp, 400*time.Millisecond, "")
+
+	// Let three workers get gated and stay blocked, accumulating backlog,
+	// then release them and let the attack run to completion.
+	time.Sleep(150 * time.Millisecond)
+	close(gt.gateOpen)
+	for range res {
+	}
+
+	waits := rp.snapshot()
+	if len(waits) == 0 {
+		t.Fatal("pacer was never consulted after the starvation point")
+	}
+	for i, w := range waits {
+		// Every scheduled wait after starvation must be a full interval.
+		// The old catch-up logic returned 0 here, which produced a burst.
+		if w < 20*time.Millisecond {
+			t.Fatalf("wait #%d after starvation was %s; want >= %s (catch-up burst?)",
+				i, w, 20*time.Millisecond)
+		}
+	}
+}
+
+// TestAttackLinearRamp verifies the end-to-end ramp shape: the interval
+// between consecutive hits shrinks over the ramp window as the rate climbs
+// linearly, rather than the attack opening at full (maximum) speed.
+func TestAttackLinearRamp(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer server.Close()
+	tr := NewStaticTargeter(Target{Method: "GET", URL: server.URL})
+
+	// Ramp from 200 to 1200 hits/s over 1s: slope 1000 hits/s per second.
+	p := LinearPacer{
+		StartAt: Rate{Freq: 200, Per: time.Second},
+		Slope:   1000,
+	}
+	atk := NewAttacker()
+
+	var timestamps []time.Time
+	for range atk.Attack(tr, p, time.Second, "") {
+		timestamps = append(timestamps, time.Now())
+	}
+
+	if len(timestamps) < 100 {
+		t.Fatalf("too few hits to assess ramp shape: %d", len(timestamps))
+	}
+
+	// Intervals are measured between consecutive hits. Compare the median
+	// interval in the first quarter of the attack against the last quarter:
+	// on a linear ramp the early intervals must be clearly larger.
+	intervals := make([]time.Duration, 0, len(timestamps)-1)
+	for i := 1; i < len(timestamps); i++ {
+		intervals = append(intervals, timestamps[i].Sub(timestamps[i-1]))
+	}
+	quarter := len(intervals) / 4
+	early := medianDuration(append([]time.Duration(nil), intervals[:quarter]...))
+	late := medianDuration(append([]time.Duration(nil), intervals[3*quarter:]...))
+
+	// The rate roughly doubles over the window, so early intervals should be
+	// comfortably larger than late ones. A full-speed start would invert this.
+	if early <= late {
+		t.Fatalf("ramp not observed: median early interval %s <= late %s (%d hits)",
+			early, late, len(timestamps))
+	}
+}
+
+// medianDuration returns the median of a slice it is allowed to reorder.
+func medianDuration(ds []time.Duration) time.Duration {
+	sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
+	return ds[len(ds)/2]
 }

@@ -472,8 +472,20 @@ func (a *Attacker) Attack(tr Targeter, p Pacer, du time.Duration, name string) <
 		}()
 
 		count := uint64(0)
+		// base is the local reference against which elapsed time is computed.
+		// It is advanced if the clock goes backwards (rollback or suspend) so
+		// that the pacer never sees a negative or jumped elapsed duration and
+		// therefore never has to catch up on a backlog of hits.
+		base := atk.began
 		for {
-			elapsed := time.Since(atk.began)
+			now := time.Now()
+			elapsed := now.Sub(base)
+			if elapsed < 0 {
+				// Clock moved backwards: re-base instead of scheduling hits
+				// in the past, which would trigger a catch-up burst.
+				base = now
+				elapsed = 0
+			}
 			if du > 0 && elapsed > du {
 				return
 			}
@@ -482,8 +494,24 @@ func (a *Attacker) Attack(tr Targeter, p Pacer, du time.Duration, name string) <
 			if stop {
 				return
 			}
+			if wait < 0 {
+				// A well-behaved pacer never returns a negative wait, but
+				// clamp defensively: time.Sleep would treat it as zero and
+				// spin, flooding the target with back-to-back hits.
+				wait = 0
+			}
 
-			time.Sleep(wait)
+			// Wait in an interruptible way so that Stop() takes effect
+			// immediately instead of after the full pacing interval. The
+			// count of dispatched ticks (returned indirectly once the
+			// results channel closes) is the number of hits actually sent.
+			timer := time.NewTimer(wait)
+			select {
+			case <-timer.C:
+			case <-a.stopch:
+				timer.Stop()
+				return
+			}
 
 			if workers < a.maxWorkers {
 				select {
