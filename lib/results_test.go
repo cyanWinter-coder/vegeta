@@ -2,7 +2,10 @@ package vegeta
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"io"
 	"math/rand"
 	"net/http"
@@ -139,6 +142,254 @@ func TestResultEncoding(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+func TestResultEncodingVersionHeader(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+	if err := enc(&Result{Code: 200}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := buf.Bytes()
+	if !bytes.HasPrefix(got, resultMagic) {
+		t.Fatalf("encoded stream doesn't start with the format magic: %q", got)
+	}
+	version := binary.BigEndian.Uint16(got[len(resultMagic):])
+	if version != ResultFormatVersion {
+		t.Errorf("got stream version %d, want %d", version, ResultFormatVersion)
+	}
+}
+
+func TestResultDecodingLegacyV1(t *testing.T) {
+	t.Parallel()
+
+	// Legacy (v1) format: a bare gob stream of Result values, as written
+	// by previous versions of NewEncoder.
+	want := []Result{
+		{
+			Attack: "fritz", Seq: 1, Code: 200,
+			Timestamp: time.Unix(100, 0), Latency: 42 * time.Millisecond,
+			BytesOut: 10, BytesIn: 20, Error: "oops", Body: []byte("body"),
+			Method: "GET", URL: "http://example.com",
+			Headers: http.Header{"A": {"b"}},
+		},
+		{
+			Attack: "fritz", Seq: 2, Code: 500,
+			Timestamp: time.Unix(200, 0), Latency: 84 * time.Millisecond,
+			BytesOut: 30, BytesIn: 40,
+		},
+	}
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	for i := range want {
+		if err := enc.Encode(&want[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dec := NewDecoder(&buf)
+	for i := range want {
+		var got Result
+		if err := dec(&got); err != nil {
+			t.Fatalf("record #%d: %v", i, err)
+		}
+		if !got.Equal(want[i]) {
+			t.Errorf("record #%d mismatch: %s", i, cmp.Diff(got, want[i]))
+		}
+		for _, f := range []Fields{FieldLatency, FieldBytesIn, FieldBytesOut, FieldCode, FieldTimestamp} {
+			if !got.Has(f) {
+				t.Errorf("record #%d: field %d reported missing in complete legacy record", i, f)
+			}
+		}
+	}
+
+	var r Result
+	if err := dec(&r); err != io.EOF {
+		t.Errorf("got %v, want io.EOF", err)
+	}
+}
+
+func TestResultDecodingLegacyV1MissingFields(t *testing.T) {
+	t.Parallel()
+
+	// A legacy record written by an older version whose Result type
+	// didn't have the Latency, BytesIn and BytesOut fields yet.
+	type legacyResult struct {
+		Attack    string
+		Seq       uint64
+		Code      uint16
+		Timestamp time.Time
+		Error     string
+		Body      []byte
+	}
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	in := legacyResult{
+		Attack: "fritz", Seq: 7, Code: 200,
+		Timestamp: time.Unix(100, 0), Error: "", Body: []byte("body"),
+	}
+	if err := enc.Encode(&in); err != nil {
+		t.Fatal(err)
+	}
+
+	var got Result
+	if err := NewDecoder(&buf)(&got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Attack != in.Attack || got.Seq != in.Seq || got.Code != in.Code ||
+		!got.Timestamp.Equal(in.Timestamp) || !bytes.Equal(got.Body, in.Body) {
+		t.Errorf("present fields not decoded: %+v", got)
+	}
+
+	// Missing fields get explicit zero defaults and are reported absent.
+	if got.Latency != 0 || got.BytesIn != 0 || got.BytesOut != 0 {
+		t.Errorf("missing fields not at their default: %+v", got)
+	}
+	for _, f := range []Fields{FieldLatency, FieldBytesIn, FieldBytesOut} {
+		if got.Has(f) {
+			t.Errorf("field %d reported present in legacy record missing it", f)
+		}
+	}
+	for _, f := range []Fields{FieldCode, FieldTimestamp} {
+		if !got.Has(f) {
+			t.Errorf("field %d reported missing in legacy record carrying it", f)
+		}
+	}
+}
+
+func TestResultDecodingUnsupportedVersion(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	buf.Write(resultMagic)
+	buf.Write([]byte{0xff, 0xff}) // version 65535
+
+	var r Result
+	err := NewDecoder(&buf)(&r)
+	var verr *UnsupportedVersionError
+	if !errors.As(err, &verr) {
+		t.Fatalf("got %v, want UnsupportedVersionError", err)
+	}
+	if verr.Version != 0xffff {
+		t.Errorf("got version %d, want %d", verr.Version, 0xffff)
+	}
+}
+
+func TestResultDecodingTruncatedStream(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+	for i := 0; i < 3; i++ {
+		if err := enc(&Result{Code: uint16(i + 1)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Truncate the stream in the middle of the last record.
+	truncated := buf.Bytes()[:buf.Len()-3]
+	dec := NewDecoder(bytes.NewReader(truncated))
+
+	var r Result
+	for i := 0; i < 2; i++ {
+		if err := dec(&r); err != nil {
+			t.Fatalf("record #%d: %v", i, err)
+		}
+	}
+
+	err := dec(&r)
+	var derr *DecodeError
+	if !errors.As(err, &derr) {
+		t.Fatalf("got %v, want DecodeError", err)
+	}
+	if derr.Record != 2 {
+		t.Errorf("got failing record #%d, want #2", derr.Record)
+	}
+	if err == io.EOF {
+		t.Error("truncated record reported as clean end of stream")
+	}
+}
+
+func TestResultDecodingCorruptStream(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+	if err := enc(&Result{Code: 200}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Append garbage after the valid record: the decoder must fail
+	// identifiably instead of silently skipping it.
+	buf.WriteString("this is not gob data")
+	dec := NewDecoder(&buf)
+
+	var r Result
+	if err := dec(&r); err != nil {
+		t.Fatalf("first record: %v", err)
+	}
+	if err := dec(&r); err == nil || err == io.EOF {
+		t.Fatalf("got %v, want a decoding error", err)
+	} else {
+		var derr *DecodeError
+		if !errors.As(err, &derr) {
+			t.Fatalf("got %v, want DecodeError", err)
+		}
+	}
+}
+
+func TestResultDecodingEmptyStream(t *testing.T) {
+	t.Parallel()
+
+	for name, rd := range map[string]io.Reader{
+		"empty":       &bytes.Reader{},
+		"header-only": bytes.NewReader(append(append([]byte{}, resultMagic...), 0, byte(ResultFormatVersion))),
+	} {
+		dec := NewDecoder(rd)
+		var r Result
+		if err := dec(&r); err != io.EOF {
+			t.Errorf("%s: got %v, want io.EOF", name, err)
+		}
+	}
+}
+
+func TestMetricsExcludeMissingFields(t *testing.T) {
+	t.Parallel()
+
+	// One complete record and one record missing latency and byte counts,
+	// as decoded from an older format version.
+	full := Result{Code: 200, Timestamp: time.Unix(100, 0), Latency: 100 * time.Millisecond, BytesIn: 10, BytesOut: 20}
+	partial := Result{Code: 200, Timestamp: time.Unix(200, 0)}
+	partial.missing = FieldLatency | FieldBytesIn | FieldBytesOut
+
+	var m Metrics
+	m.Add(&full)
+	m.Add(&partial)
+	m.Close()
+
+	if m.Requests != 2 {
+		t.Errorf("got %d requests, want 2", m.Requests)
+	}
+	if m.Latencies.Total != full.Latency {
+		t.Errorf("got total latency %s, want %s", m.Latencies.Total, full.Latency)
+	}
+	if m.Latencies.Mean != full.Latency {
+		t.Errorf("got mean latency %s, want %s", m.Latencies.Mean, full.Latency)
+	}
+	if m.BytesIn.Total != full.BytesIn || m.BytesOut.Total != full.BytesOut {
+		t.Errorf("got bytes in/out %d/%d, want %d/%d",
+			m.BytesIn.Total, m.BytesOut.Total, full.BytesIn, full.BytesOut)
+	}
+	if m.BytesIn.Mean != float64(full.BytesIn) || m.BytesOut.Mean != float64(full.BytesOut) {
+		t.Errorf("got mean bytes in/out %f/%f, want %f/%f",
+			m.BytesIn.Mean, m.BytesOut.Mean, float64(full.BytesIn), float64(full.BytesOut))
 	}
 }
 

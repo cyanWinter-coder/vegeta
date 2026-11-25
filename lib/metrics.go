@@ -46,31 +46,44 @@ type Metrics struct {
 }
 
 // Add implements the Add method of the Report interface by adding the given
-// Result to Metrics.
+// Result to Metrics. Fields reported as absent by Result.Has (e.g. fields
+// missing from an older-format record) are excluded from the corresponding
+// statistics instead of being counted as zero values.
 func (m *Metrics) Add(r *Result) {
 	m.init()
 
 	m.Requests++
-	m.StatusCodes[strconv.Itoa(int(r.Code))]++
-	m.BytesOut.Total += r.BytesOut
-	m.BytesIn.Total += r.BytesIn
 
-	m.Latencies.Add(r.Latency)
-
-	if m.Earliest.IsZero() || m.Earliest.After(r.Timestamp) {
-		m.Earliest = r.Timestamp
+	if r.Has(FieldCode) {
+		m.StatusCodes[strconv.Itoa(int(r.Code))]++
+		if r.Code >= 200 && r.Code < 400 {
+			m.success++
+		}
 	}
 
-	if r.Timestamp.After(m.Latest) {
-		m.Latest = r.Timestamp
+	if r.Has(FieldBytesOut) {
+		m.BytesOut.Add(r.BytesOut)
+	}
+	if r.Has(FieldBytesIn) {
+		m.BytesIn.Add(r.BytesIn)
 	}
 
-	if end := r.End(); end.After(m.End) {
-		m.End = end
+	if r.Has(FieldLatency) {
+		m.Latencies.Add(r.Latency)
 	}
 
-	if r.Code >= 200 && r.Code < 400 {
-		m.success++
+	if r.Has(FieldTimestamp) {
+		if m.Earliest.IsZero() || m.Earliest.After(r.Timestamp) {
+			m.Earliest = r.Timestamp
+		}
+
+		if r.Timestamp.After(m.Latest) {
+			m.Latest = r.Timestamp
+		}
+
+		if end := r.End(); end.After(m.End) {
+			m.End = end
+		}
 	}
 
 	if r.Error != "" {
@@ -80,7 +93,7 @@ func (m *Metrics) Add(r *Result) {
 		}
 	}
 
-	if m.Histogram != nil {
+	if m.Histogram != nil && r.Has(FieldLatency) {
 		m.Histogram.Add(r)
 	}
 }
@@ -104,10 +117,10 @@ func (m *Metrics) Close() {
 		m.Throughput /= (m.Duration + m.Wait).Seconds()
 	}
 
-	m.BytesIn.Mean = float64(m.BytesIn.Total) / float64(m.Requests)
-	m.BytesOut.Mean = float64(m.BytesOut.Total) / float64(m.Requests)
+	m.BytesIn.computeMean()
+	m.BytesOut.computeMean()
 	m.Success = float64(m.success) / float64(m.Requests)
-	m.Latencies.Mean = time.Duration(float64(m.Latencies.Total) / float64(m.Requests))
+	m.Latencies.computeMean()
 	m.Latencies.P50 = m.Latencies.Quantile(0.50)
 	m.Latencies.P90 = m.Latencies.Quantile(0.90)
 	m.Latencies.P95 = m.Latencies.Quantile(0.95)
@@ -148,11 +161,13 @@ type LatencyMetrics struct {
 	Min time.Duration `json:"min"`
 
 	estimator estimator
+	n         uint64
 }
 
 // Add adds the given latency to the latency metrics.
 func (l *LatencyMetrics) Add(latency time.Duration) {
 	l.init()
+	l.n++
 	if l.Total += latency; latency > l.Max {
 		l.Max = latency
 	}
@@ -160,6 +175,13 @@ func (l *LatencyMetrics) Add(latency time.Duration) {
 		l.Min = latency
 	}
 	l.estimator.Add(float64(latency))
+}
+
+// computeMean computes the mean latency over the latencies actually added.
+func (l *LatencyMetrics) computeMean() {
+	if l.n > 0 {
+		l.Mean = time.Duration(float64(l.Total) / float64(l.n))
+	}
 }
 
 // Quantile returns the nth quantile from the latency summary.
@@ -182,6 +204,21 @@ type ByteMetrics struct {
 	Total uint64 `json:"total"`
 	// Mean is the mean number of flowing bytes per hit.
 	Mean float64 `json:"mean"`
+
+	n uint64
+}
+
+// Add adds the given byte count to the byte metrics.
+func (b *ByteMetrics) Add(v uint64) {
+	b.Total += v
+	b.n++
+}
+
+// computeMean computes the mean over the byte counts actually added.
+func (b *ByteMetrics) computeMean() {
+	if b.n > 0 {
+		b.Mean = float64(b.Total) / float64(b.n)
+	}
 }
 
 type estimator interface {

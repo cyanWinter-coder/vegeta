@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/csv"
 	"encoding/gob"
+	"fmt"
 	"io"
 	"net/http"
 	"net/textproto"
@@ -22,6 +24,20 @@ func init() {
 	gob.Register(&Result{})
 }
 
+// Fields is a bitmask identifying a set of Result fields. It is used to
+// describe which fields were actually present in a decoded result record.
+type Fields uint16
+
+// The set of Result fields that feed statistics and can therefore be
+// reported as absent by Result.Has.
+const (
+	FieldLatency Fields = 1 << iota
+	FieldBytesIn
+	FieldBytesOut
+	FieldCode
+	FieldTimestamp
+)
+
 // Result contains the results of a single Target hit.
 type Result struct {
 	Attack    string        `json:"attack"`
@@ -36,7 +52,21 @@ type Result struct {
 	Method    string        `json:"method"`
 	URL       string        `json:"url"`
 	Headers   http.Header   `json:"headers"`
+
+	// missing marks fields that were absent from the record this Result
+	// was decoded from. It is never serialized.
+	missing Fields
 }
+
+// Has reports whether the given fields were present in the record this
+// Result was decoded from. Results that were created programmatically or
+// decoded from the current format version report all fields present.
+//
+// Fields absent from older-format records are left at their zero value by
+// the Decoder and reported as missing here, so that statistics can exclude
+// them instead of treating the zero value as a real measurement (e.g. a
+// 0ms latency).
+func (r *Result) Has(f Fields) bool { return r.missing&f == 0 }
 
 // End returns the time at which a Result ended.
 func (r *Result) End() time.Time { return r.Timestamp.Add(r.Latency) }
@@ -141,10 +171,210 @@ func NewRoundRobinDecoder(dec ...Decoder) Decoder {
 	}
 }
 
-// NewDecoder returns a new gob Decoder for the given io.Reader.
+// Format versions of the gob result encoding written by NewEncoder and
+// read by NewDecoder.
+const (
+	// ResultFormatV1 is the legacy, unversioned encoding: a bare gob
+	// stream of Result values with no stream header.
+	ResultFormatV1 uint16 = 1
+	// ResultFormatV2 is the current encoding: a stream header carrying
+	// the format version, followed by a gob stream of versioned records.
+	ResultFormatV2 uint16 = 2
+	// ResultFormatVersion is the version of the gob result encoding
+	// written by NewEncoder.
+	ResultFormatVersion = ResultFormatV2
+)
+
+// resultMagic prefixes every result stream written by NewEncoder, followed
+// by the big-endian uint16 format version. The leading 0xff cannot start a
+// legacy gob stream, so the two formats are unambiguous to sniff.
+var resultMagic = []byte("\xffvegeta:results:")
+
+// A DecodeError describes a failure to decode a single result record,
+// e.g. because the record was truncated or corrupted. It is returned by
+// Decoders built by NewDecoder; use errors.As to identify it.
+type DecodeError struct {
+	// Version is the format version of the stream being decoded, or 0 if
+	// the stream header itself could not be read.
+	Version uint16
+	// Record is the zero-based index of the record that failed to decode.
+	Record uint64
+	// Err is the underlying decoding error.
+	Err error
+}
+
+func (e *DecodeError) Error() string {
+	return fmt.Sprintf("vegeta: decoding result record #%d (format v%d): %v",
+		e.Record, e.Version, e.Err)
+}
+
+// Unwrap returns the underlying decoding error.
+func (e *DecodeError) Unwrap() error { return e.Err }
+
+// An UnsupportedVersionError is returned when decoding a result stream
+// whose format version is newer than ResultFormatVersion.
+type UnsupportedVersionError struct {
+	// Version is the unsupported format version found in the stream header.
+	Version uint16
+}
+
+func (e *UnsupportedVersionError) Error() string {
+	return fmt.Sprintf("vegeta: unsupported result format version %d (supported: %d-%d)",
+		e.Version, ResultFormatV1, ResultFormatVersion)
+}
+
+// NewDecoder returns a new Decoder for the given io.Reader. It sniffs the
+// stream header to select the decoding for the format version in use:
+// streams written by the current NewEncoder (ResultFormatV2) as well as
+// legacy unversioned gob streams (ResultFormatV1) are supported.
 func NewDecoder(rd io.Reader) Decoder {
+	br := bufio.NewReader(rd)
+	if magic, err := br.Peek(len(resultMagic)); err != nil || !bytes.Equal(magic, resultMagic) {
+		// No stream header: legacy unversioned gob stream.
+		return newV1Decoder(br)
+	}
+
+	header := make([]byte, len(resultMagic)+2)
+	if _, err := io.ReadFull(br, header); err != nil {
+		return func(*Result) error {
+			return &DecodeError{Err: fmt.Errorf("reading stream header: %w", err)}
+		}
+	}
+
+	switch version := binary.BigEndian.Uint16(header[len(resultMagic):]); version {
+	case ResultFormatV2:
+		return newV2Decoder(br)
+	default:
+		return func(*Result) error {
+			return &UnsupportedVersionError{Version: version}
+		}
+	}
+}
+
+// resultRecord is the wire representation of a single Result in the
+// current (v2) gob encoding. Every record carries the format version so
+// that records are self-describing and version mismatches within a stream
+// are detected instead of silently misdecoded.
+type resultRecord struct {
+	Version uint16
+	Result  Result
+}
+
+func newV2Decoder(rd io.Reader) Decoder {
 	dec := gob.NewDecoder(rd)
-	return func(r *Result) error { return dec.Decode(r) }
+	var n uint64
+	return func(r *Result) error {
+		var rec resultRecord
+		if err := dec.Decode(&rec); err != nil {
+			if err == io.EOF {
+				return io.EOF
+			}
+			return &DecodeError{Version: ResultFormatV2, Record: n, Err: err}
+		}
+		if rec.Version != ResultFormatV2 {
+			return &DecodeError{
+				Version: ResultFormatV2,
+				Record:  n,
+				Err: fmt.Errorf("record version %d doesn't match stream version %d",
+					rec.Version, ResultFormatV2),
+			}
+		}
+		*r = rec.Result
+		n++
+		return nil
+	}
+}
+
+// resultV1 mirrors Result with pointer fields so that decoding a legacy
+// (v1) record reveals which fields were actually present in the stream:
+// gob omits fields the writer didn't have (as well as zero-valued fields),
+// which leaves the corresponding pointer nil after decoding.
+type resultV1 struct {
+	Attack    *string
+	Seq       *uint64
+	Code      *uint16
+	Timestamp *time.Time
+	Latency   *time.Duration
+	BytesOut  *uint64
+	BytesIn   *uint64
+	Error     *string
+	Body      *[]byte
+	Method    *string
+	URL       *string
+	Headers   *http.Header
+}
+
+// result converts the decoded record into a Result. Fields absent from the
+// record are left at their zero value (the explicit default) and marked as
+// missing so they are excluded from statistics.
+func (rec *resultV1) result() Result {
+	var r Result
+	if rec.Attack != nil {
+		r.Attack = *rec.Attack
+	}
+	if rec.Seq != nil {
+		r.Seq = *rec.Seq
+	}
+	if rec.Error != nil {
+		r.Error = *rec.Error
+	}
+	if rec.Body != nil {
+		r.Body = *rec.Body
+	}
+	if rec.Method != nil {
+		r.Method = *rec.Method
+	}
+	if rec.URL != nil {
+		r.URL = *rec.URL
+	}
+	if rec.Headers != nil {
+		r.Headers = *rec.Headers
+	}
+
+	// Fields that feed statistics get their absence tracked explicitly.
+	if rec.Code != nil {
+		r.Code = *rec.Code
+	} else {
+		r.missing |= FieldCode
+	}
+	if rec.Timestamp != nil {
+		r.Timestamp = *rec.Timestamp
+	} else {
+		r.missing |= FieldTimestamp
+	}
+	if rec.Latency != nil {
+		r.Latency = *rec.Latency
+	} else {
+		r.missing |= FieldLatency
+	}
+	if rec.BytesOut != nil {
+		r.BytesOut = *rec.BytesOut
+	} else {
+		r.missing |= FieldBytesOut
+	}
+	if rec.BytesIn != nil {
+		r.BytesIn = *rec.BytesIn
+	} else {
+		r.missing |= FieldBytesIn
+	}
+	return r
+}
+
+func newV1Decoder(rd io.Reader) Decoder {
+	dec := gob.NewDecoder(rd)
+	var n uint64
+	return func(r *Result) error {
+		var rec resultV1
+		if err := dec.Decode(&rec); err != nil {
+			if err == io.EOF {
+				return io.EOF
+			}
+			return &DecodeError{Version: ResultFormatV1, Record: n, Err: err}
+		}
+		*r = rec.result()
+		n++
+		return nil
+	}
 }
 
 // Decode is an an adapter method calling the Decoder function itself with the
@@ -154,10 +384,21 @@ func (dec Decoder) Decode(r *Result) error { return dec(r) }
 // An Encoder encodes a Result and returns an error in case of failure.
 type Encoder func(*Result) error
 
-// NewEncoder returns a new Result encoder closure for the given io.Writer
-func NewEncoder(r io.Writer) Encoder {
-	enc := gob.NewEncoder(r)
-	return func(r *Result) error { return enc.Encode(r) }
+// NewEncoder returns a new Result encoder closure for the given io.Writer.
+// It writes a stream header carrying ResultFormatVersion, followed by
+// versioned gob records. Decoders built by NewDecoder read this format as
+// well as the previous, unversioned gob format.
+func NewEncoder(w io.Writer) Encoder {
+	header := binary.BigEndian.AppendUint16(
+		append([]byte{}, resultMagic...), ResultFormatVersion)
+	_, err := w.Write(header)
+	enc := gob.NewEncoder(w)
+	return func(r *Result) error {
+		if err != nil {
+			return err
+		}
+		return enc.Encode(resultRecord{Version: ResultFormatVersion, Result: *r})
+	}
 }
 
 // Encode is an an adapter method calling the Encoder function itself with the
