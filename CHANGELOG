@@ -1,3 +1,12 @@
+Unreleased
+  Harden http target parsing: trim whitespace, ignore blank/comment lines,
+    reject malformed request lines and headers, and report 1-indexed line
+    numbers in parse errors
+  Add -base-url flag to resolve relative target URLs against an absolute
+    http/https base; relative URLs without a base now fail at parse time
+  Keep the request line strictly method+URL so headers can no longer be
+    concatenated into a request path when a blank separator is missing
+
 2018-05-18: v7.0.0
   Include response body in hit results (#279)
   Added support for h2c requests (HTTP/2 without TLS) (#261)

@@ -200,6 +200,27 @@ Prints the version and exits.
 
 ### `attack` command
 
+#### `-base-url`
+
+Specifies an absolute `http` or `https` base URL used to resolve target URLs
+that are relative references (for example `/v1/ping` or `v1/ping`). Absolute
+target URLs keep their own scheme and host and are not rewritten. When this
+flag is empty, every target URL must itself be absolute; relative targets then
+fail during parsing instead of producing malformed requests. The same
+resolution applies to both the `http` and `json` target formats.
+
+```
+# targets.txt
+GET /v1/ping
+GET v1/ping
+```
+
+```bash
+vegeta attack -targets=targets.txt -base-url=https://api.example.com:8443/rest/
+# resolves to https://api.example.com:8443/v1/ping
+# and         https://api.example.com:8443/rest/v1/ping
+```
+
 #### `-body`
 
 Specifies the file whose content will be set as the body of every
@@ -260,6 +281,19 @@ as request bodies (as exemplified below).
 Although targets in this format can be produced by other programs, it was originally
 meant to be used by people writing targets by hand for simple use cases.
 
+Parsing rules:
+
+- Empty lines and lines whose first non-space character is `#` are ignored.
+- Leading and trailing whitespace on any line is trimmed, so indentation and
+  stray trailing spaces never change how a line is parsed.
+- A request line holds exactly a method and a URL, separated by any run of
+  whitespace. Extra fields, malformed headers and unreadable body files are
+  rejected rather than sent.
+- Every error message includes the 1-indexed source line, so the offending
+  entry can be located directly in files maintained by different teams.
+- Targets are read and validated eagerly by default (see `-lazy`), so an
+  invalid target aborts the command before any traffic is generated.
+
 Here are a few examples of valid targets files in the http format:
 
 ###### Simple targets
@@ -301,7 +335,8 @@ X-Account-ID: 99
 
 ###### Add comments
 
-Lines starting with `#` are ignored.
+Empty lines and lines whose first non-space character is `#` are ignored, so
+comments may be indented and placed between a request and its headers.
 
 ```
 # get a dragon ball

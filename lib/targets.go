@@ -130,15 +130,30 @@ func (tr Targeter) Decode(t *Target) error {
 // body will be set as the Target's body if no body is provided in each target definition.
 // hdr will be merged with the each Target's headers.
 func NewJSONTargeter(src io.Reader, body []byte, header http.Header) Targeter {
+	return NewJSONTargeterWithBaseURL(src, body, header, "")
+}
+
+// NewJSONTargeterWithBaseURL is NewJSONTargeter with an explicit baseURL used
+// to resolve relative target URLs, mirroring NewHTTPTargeterWithBaseURL.
+func NewJSONTargeterWithBaseURL(src io.Reader, body []byte, header http.Header, baseURL string) Targeter {
 	type reader struct {
 		*bufio.Reader
 		sync.Mutex
 	}
 	rd := reader{Reader: bufio.NewReader(src)}
 
+	var base *url.URL
+	var baseErr error
+	if baseURL != "" {
+		base, baseErr = parseBaseURL(baseURL)
+	}
+
 	return func(tgt *Target) (err error) {
 		if tgt == nil {
 			return ErrNilTarget
+		}
+		if baseErr != nil {
+			return baseErr
 		}
 
 		var jl jlexer.Lexer
@@ -171,7 +186,9 @@ func NewJSONTargeter(src io.Reader, body []byte, header http.Header) Targeter {
 		}
 
 		tgt.Method = t.Method
-		tgt.URL = t.URL
+		if tgt.URL, err = resolveTargetURL(t.URL, base); err != nil {
+			return fmt.Errorf("bad URL: %s, %w", t.URL, err)
+		}
 		if tgt.Body = body; len(t.Body) > 0 {
 			tgt.Body = t.Body
 		}
@@ -257,132 +274,270 @@ func ReadAllTargets(t Targeter) (tgts []Target, err error) {
 //	POST https://foo.bar/b/c/a
 //	Header-X: 123
 //
+// Empty lines and lines whose first non-space character is '#' are ignored.
+// Trailing whitespace never affects parsing.
+//
+// If baseURL is not empty, target URLs without a scheme are resolved against
+// it as relative references; otherwise every target URL must be an absolute
+// http or https URL. Invalid URLs and an invalid baseURL produce errors rather
+// than malformed requests.
+//
 // body will be set as the Target's body if no body is provided.
 // hdr will be merged with the each Target's headers.
 func NewHTTPTargeter(src io.Reader, body []byte, hdr http.Header) Targeter {
+	return NewHTTPTargeterWithBaseURL(src, body, hdr, "")
+}
+
+// NewHTTPTargeterWithBaseURL is NewHTTPTargeter with an explicit baseURL used
+// to resolve relative target URLs. An invalid baseURL makes every subsequent
+// Decode call fail with an error instead of producing a request.
+func NewHTTPTargeterWithBaseURL(src io.Reader, body []byte, hdr http.Header, baseURL string) Targeter {
 	var mu sync.Mutex
-	sc := peekingScanner{src: bufio.NewScanner(src)}
+	sc := newTargetScanner(bufio.NewScanner(src))
+
+	var base *url.URL
+	var baseErr error
+	if baseURL != "" {
+		base, baseErr = parseBaseURL(baseURL)
+	}
+
 	return func(tgt *Target) (err error) {
-		mu.Lock()
-		var bodyLine string
-		defer func() {
-			mu.Unlock()
-			// Body files can block independently of the target stream.
-			if bodyLine != "" {
-				var readErr error
-				if tgt.Body, readErr = os.ReadFile(bodyLine[1:]); readErr != nil {
-					err = fmt.Errorf("bad body: %w", readErr)
+		if tgt == nil {
+			return ErrNilTarget
+		}
+		if baseErr != nil {
+			return baseErr
+		}
+
+		var bodyLinePath string
+		var bodyLine int
+		var scannerErr error
+
+		func() {
+			mu.Lock()
+			defer mu.Unlock()
+
+			var line scannedLine
+			for {
+				var ok bool
+				if line, ok = sc.Scan(); !ok {
+					err = ErrNoTargets
+					return
+				}
+				if line.text != "" && line.text[0] != '#' {
+					break
+				}
+			}
+			requestLine := line.line
+
+			tgt.Body = body
+			tgt.Header = http.Header{}
+			for k, vs := range hdr {
+				tgt.Header[k] = vs
+			}
+
+			// Fields splits on any run of whitespace, so extra spaces or tabs
+			// between the method and the URL can no longer leak into the URL or
+			// into a header.
+			tokens := strings.Fields(line.text)
+			if len(tokens) == 1 {
+				err = fmt.Errorf("bad target (line %d): %q, missing URL", requestLine, line.text)
+				return
+			}
+			if len(tokens) > 2 {
+				err = fmt.Errorf("bad target (line %d): %q, unexpected fields after URL", requestLine, line.text)
+				return
+			}
+			if !startsWithHTTPMethod(line.text) {
+				err = fmt.Errorf("bad method (line %d): %s", requestLine, tokens[0])
+				return
+			}
+			tgt.Method = tokens[0]
+			if tgt.URL, err = resolveTargetURL(tokens[1], base); err != nil {
+				err = fmt.Errorf("bad URL (line %d): %s, %w", requestLine, tokens[1], err)
+				return
+			}
+
+			// Eagerly pull the following line so a non-EOF scanner error is
+			// reported by this decode (matching the historical streaming
+			// contract) and so the first header/body line can be decided on
+			// without an extra scanner round trip.
+			next, ok := sc.Scan()
+			if !ok {
+				if sc.Err() != nil {
+					err = ErrNoTargets
+				}
+				return
+			}
+
+			for {
+				switch {
+				case next.text == "":
+					// A blank line ends this target.
+				case next.text[0] == '#':
+					// Comments between a request and its headers are ignored.
+				case strings.HasPrefix(next.text, "@"):
+					bodyLine = next.line
+					bodyLinePath = next.text[1:]
+					// The line can arrive while the scanner already carries a
+					// non-EOF read error: remember it so a successfully read
+					// body still ends the decode with ErrNoTargets, while a
+					// body read failure below gets to take precedence.
+					scannerErr = sc.Err()
+					return
+				case startsWithHTTPMethod(next.text):
+					// A new request without a separating blank line. Push it
+					// back so it is decoded as its own target instead of being
+					// swallowed as an (invalid) header.
+					sc.unread(next)
+					return
+				default:
+					headerTokens := strings.SplitN(next.text, ":", 2)
+					if len(headerTokens) < 2 {
+						err = fmt.Errorf("bad header (line %d): %s", next.line, next.text)
+						return
+					}
+					key := strings.TrimSpace(headerTokens[0])
+					val := strings.TrimSpace(headerTokens[1])
+					if key == "" || val == "" {
+						err = fmt.Errorf("bad header (line %d): %s", next.line, next.text)
+						return
+					}
+					// Add key/value directly to the http.Header
+					// (map[string][]string). http.Header.Add() canonicalizes
+					// keys but vegeta is used to test systems that require
+					// case-sensitive headers.
+					tgt.Header[key] = append(tgt.Header[key], val)
+				}
+
+				if next, ok = sc.Scan(); !ok {
+					if sc.Err() != nil {
+						err = ErrNoTargets
+					}
+					return
 				}
 			}
 		}()
 
-		if tgt == nil {
-			return ErrNilTarget
+		if err != nil || bodyLinePath == "" {
+			return err
 		}
 
-		var line string
-		for {
-			if !sc.Scan() {
+		// Body files can block independently of the target stream, so the read
+		// happens after the scanner lock is released: a slow body file must not
+		// stall other targets' decodes.
+		if bodyLinePath != "" {
+			var readErr error
+			if tgt.Body, readErr = os.ReadFile(bodyLinePath); readErr != nil {
+				// A failure to open the body file is more actionable than the
+				// scanner state that followed its reference, so it takes
+				// precedence (and stays unwrappable to os.ErrNotExist).
+				return fmt.Errorf("bad body (line %d): %w", bodyLine, readErr)
+			}
+			if scannerErr != nil {
 				return ErrNoTargets
 			}
-			line = strings.TrimSpace(sc.Text())
-
-			if len(line) != 0 && line[0] != '#' {
-				break
-			}
 		}
-
-		tgt.Body = body
-		tgt.Header = http.Header{}
-		for k, vs := range hdr {
-			tgt.Header[k] = vs
-		}
-
-		tokens := strings.SplitN(line, " ", 2)
-		if len(tokens) < 2 {
-			return fmt.Errorf("bad target: %s", line)
-		}
-		if !startsWithHTTPMethod(line) {
-			return fmt.Errorf("bad method: %s", tokens[0])
-		}
-		tgt.Method = tokens[0]
-		if _, err = url.ParseRequestURI(tokens[1]); err != nil {
-			return fmt.Errorf("bad URL: %s, %w", tokens[1], err)
-		}
-		tgt.URL = tokens[1]
-		line = strings.TrimSpace(sc.Peek())
-		if line == "" || startsWithHTTPMethod(line) {
-			return nil
-		}
-		for sc.Scan() {
-			if line = strings.TrimSpace(sc.Text()); line == "" {
-				break
-			} else if strings.HasPrefix(line, "#") {
-				continue
-			} else if strings.HasPrefix(line, "@") {
-				bodyLine = line
-				break
-			}
-			tokens = strings.SplitN(line, ":", 2)
-			if len(tokens) < 2 {
-				return fmt.Errorf("bad header: %s", line)
-			}
-			for i := range tokens {
-				if tokens[i] = strings.TrimSpace(tokens[i]); tokens[i] == "" {
-					return fmt.Errorf("bad header: %s", line)
-				}
-			}
-			// Add key/value directly to the http.Header (map[string][]string).
-			// http.Header.Add() canonicalizes keys but vegeta is used
-			// to test systems that require case-sensitive headers.
-			tgt.Header[tokens[0]] = append(tgt.Header[tokens[0]], tokens[1])
-		}
-		if err = sc.Err(); err != nil {
-			return ErrNoTargets
-		}
-		return nil
+		return err
 	}
+}
+
+// parseBaseURL validates the base URL targets are resolved against. It must be
+// an absolute http or https URL.
+func parseBaseURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("bad base URL: %s, %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("bad base URL: %s, must be an absolute http or https URL", raw)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("bad base URL: %s, missing host", raw)
+	}
+	return u, nil
+}
+
+// resolveTargetURL validates raw and, when it is not an absolute URL, resolves
+// it against base. Absolute targets must use the http or https scheme and
+// carry a host.
+func resolveTargetURL(raw string, base *url.URL) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if u.IsAbs() {
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return "", fmt.Errorf("unsupported scheme %q", u.Scheme)
+		}
+		if u.Host == "" {
+			return "", errors.New("missing host")
+		}
+		return u.String(), nil
+	}
+	if base == nil {
+		return "", errors.New("relative URL without a base URL")
+	}
+	return base.ResolveReference(u).String(), nil
 }
 
 var httpMethodChecker = regexp.MustCompile(`^[A-Z]+\s`)
 
 // A line starts with an http method when the first word is uppercase ascii
-// followed by a space.
+// followed by whitespace.
 func startsWithHTTPMethod(t string) bool {
 	return httpMethodChecker.MatchString(t)
 }
 
-// Wrap a Scanner so we can cheat and look at the next value and react accordingly,
-// but still have it be around the next time we Scan() + Text()
-type peekingScanner struct {
-	src    *bufio.Scanner
-	peeked string
+// scannedLine pairs a trimmed line with its 1-indexed line number in the
+// source. Line numbers make parse errors actionable on files maintained by
+// different teams.
+type scannedLine struct {
+	text string
+	line int
 }
 
-func (s *peekingScanner) Err() error {
+// targetScanner wraps a bufio.Scanner with one line of pushback while tracking
+// line numbers. Text is trimmed of leading and trailing whitespace so that
+// indentation and trailing spaces never affect parsing.
+type targetScanner struct {
+	src     *bufio.Scanner
+	peeked  scannedLine
+	hasPeek bool
+	line    int
+	err     error
+}
+
+func newTargetScanner(src *bufio.Scanner) *targetScanner {
+	return &targetScanner{src: src}
+}
+
+// Scan returns the next line and true, or false at EOF or on a scanner error.
+// The returned line stays available for a subsequent unread.
+func (s *targetScanner) Scan() (scannedLine, bool) {
+	if s.hasPeek {
+		next := s.peeked
+		s.hasPeek = false
+		return next, true
+	}
+	if s.src.Scan() {
+		s.line++
+		return scannedLine{text: strings.TrimSpace(s.src.Text()), line: s.line}, true
+	}
+	s.err = s.src.Err()
+	return scannedLine{}, false
+}
+
+// unread returns the line most recently returned by Scan to the head of the
+// stream, preserving its original line number.
+func (s *targetScanner) unread(line scannedLine) {
+	s.peeked = line
+	s.hasPeek = true
+}
+
+func (s *targetScanner) Err() error {
+	if s.err != nil {
+		return s.err
+	}
 	return s.src.Err()
-}
-
-func (s *peekingScanner) Peek() string {
-	if !s.src.Scan() {
-		return ""
-	}
-	s.peeked = s.src.Text()
-	return s.peeked
-}
-
-func (s *peekingScanner) Scan() bool {
-	if s.peeked == "" {
-		return s.src.Scan()
-	}
-	return true
-}
-
-func (s *peekingScanner) Text() string {
-	if s.peeked == "" {
-		return s.src.Text()
-	}
-	t := s.peeked
-	s.peeked = ""
-	return t
 }

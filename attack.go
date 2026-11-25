@@ -35,6 +35,7 @@ func attackCmd() command {
 	fs.StringVar(&opts.targetsf, "targets", "stdin", "Targets file")
 	fs.StringVar(&opts.format, "format", vegeta.HTTPTargetFormat,
 		fmt.Sprintf("Targets format [%s]", strings.Join(vegeta.TargetFormats, ", ")))
+	fs.StringVar(&opts.baseURL, "base-url", "", "Base URL used to resolve relative target URLs. Must be an absolute http or https URL")
 	fs.StringVar(&opts.outputf, "output", "stdout", "Output file")
 	fs.StringVar(&opts.bodyf, "body", "", "Requests body file")
 	fs.BoolVar(&opts.chunked, "chunked", false, "Send body with chunked transfer encoding")
@@ -81,6 +82,7 @@ type attackOpts struct {
 	name           string
 	targetsf       string
 	format         string
+	baseURL        string
 	outputf        string
 	bodyf          string
 	certf          string
@@ -158,9 +160,9 @@ func attack(opts *attackOpts) (err error) {
 
 	switch opts.format {
 	case vegeta.JSONTargetFormat:
-		tr = vegeta.NewJSONTargeter(src, body, hdr)
+		tr = vegeta.NewJSONTargeterWithBaseURL(src, body, hdr, opts.baseURL)
 	case vegeta.HTTPTargetFormat:
-		tr = vegeta.NewHTTPTargeter(src, body, hdr)
+		tr = vegeta.NewHTTPTargeterWithBaseURL(src, body, hdr, opts.baseURL)
 	default:
 		return fmt.Errorf("format %q isn't one of [%s]",
 			opts.format, strings.Join(vegeta.TargetFormats, ", "))
